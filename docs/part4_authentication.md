@@ -429,6 +429,462 @@ fun Application.configureCognitoAuth() {
 
 ---
 
+### 4.9 API Key認証
+
+#### API Key認証とは
+
+**API Key**: サービスやクライアントを識別するための秘密の文字列
+
+**特徴**:
+- シンプルで実装が容易
+- ユーザー認証ではなく、アプリケーション認証に適している
+- 長期間有効なトークン
+
+**使用例**:
+```
+Authorization: Bearer sk_live_1234567890abcdef
+X-API-Key: your-api-key-here
+```
+
+---
+
+#### API Key認証の使用ケース
+
+**適している場面**:
+- ✅ サーバー間通信（Server-to-Server）
+- ✅ サードパーティAPIへのアクセス
+- ✅ 内部マイクロサービス間の認証
+- ✅ 管理用APIやバックオフィスツール
+- ✅ Webhookエンドポイントの保護
+
+**適していない場面**:
+- ❌ エンドユーザーのログイン（OAuth/JWTを使うべき）
+- ❌ 細かい権限制御が必要な場合
+- ❌ 高セキュリティが求められる金融系アプリ
+
+**モバイルBFFでの使用例**:
+```
+モバイルアプリ
+    ↓ OAuth/JWT（ユーザー認証）
+BFF（Ktorアプリ）
+    ↓ API Key（アプリケーション認証）
+バックエンドサービス（決済API、通知サービスなど）
+```
+
+---
+
+#### API Key認証の実装（Ktor）
+
+**カスタム認証プロバイダー**:
+```kotlin
+import io.ktor.server.auth.*
+import io.ktor.server.application.*
+import io.ktor.server.response.*
+import io.ktor.http.*
+
+data class ApiKeyPrincipal(val apiKey: String) : Principal
+
+fun Application.configureApiKeyAuth() {
+    install(Authentication) {
+        apiKey("api-key-auth") {
+            validate { credential ->
+                // データベースまたは設定からAPI Keyを検証
+                if (isValidApiKey(credential)) {
+                    ApiKeyPrincipal(credential)
+                } else {
+                    null
+                }
+            }
+        }
+    }
+}
+
+// カスタム認証プロバイダーの定義
+fun AuthenticationConfig.apiKey(
+    name: String,
+    configure: ApiKeyAuthenticationProvider.Config.() -> Unit
+) {
+    val provider = ApiKeyAuthenticationProvider.Config(name).apply(configure).build()
+    register(provider)
+}
+
+class ApiKeyAuthenticationProvider(config: Config) : AuthenticationProvider(config) {
+    private val validate = config.validate
+
+    class Config(name: String) : AuthenticationProvider.Config(name) {
+        var validate: suspend (String) -> Principal? = { null }
+
+        fun build() = ApiKeyAuthenticationProvider(this)
+    }
+
+    override suspend fun onAuthenticate(context: AuthenticationContext) {
+        val call = context.call
+        val apiKey = call.request.headers["X-API-Key"]
+            ?: call.request.headers["Authorization"]?.removePrefix("Bearer ")
+
+        val principal = apiKey?.let { validate(it) }
+
+        if (principal != null) {
+            context.principal(principal)
+        } else {
+            context.challenge("ApiKeyAuth", AuthenticationFailedCause.InvalidCredentials) { challenge, call ->
+                call.respond(
+                    HttpStatusCode.Unauthorized,
+                    mapOf("error" to "Invalid or missing API key")
+                )
+                challenge.complete()
+            }
+        }
+    }
+}
+```
+
+**API Keyの検証**:
+```kotlin
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.security.MessageDigest
+
+suspend fun isValidApiKey(apiKey: String): Boolean = withContext(Dispatchers.IO) {
+    // オプション1: 環境変数から検証
+    val validKeys = System.getenv("VALID_API_KEYS")?.split(",") ?: emptyList()
+    if (validKeys.contains(apiKey)) {
+        return@withContext true
+    }
+
+    // オプション2: データベースから検証
+    val hashedKey = hashApiKey(apiKey)
+    apiKeyRepository.exists(hashedKey)
+}
+
+fun hashApiKey(apiKey: String): String {
+    val digest = MessageDigest.getInstance("SHA-256")
+    val hash = digest.digest(apiKey.toByteArray())
+    return hash.joinToString("") { "%02x".format(it) }
+}
+```
+
+**保護されたルート**:
+```kotlin
+routing {
+    authenticate("api-key-auth") {
+        get("/api/internal/metrics") {
+            val principal = call.principal<ApiKeyPrincipal>()!!
+            call.respond(mapOf(
+                "authenticatedWith" to principal.apiKey.take(10) + "...",
+                "metrics" to getMetrics()
+            ))
+        }
+
+        post("/api/webhooks/payment") {
+            // 外部サービスからのWebhookを受信
+            val payload = call.receive<PaymentWebhook>()
+            processPayment(payload)
+            call.respond(HttpStatusCode.OK)
+        }
+    }
+}
+```
+
+---
+
+#### 複数の認証方式の併用
+
+**JWT + API Keyの組み合わせ**:
+```kotlin
+fun Application.configureMultipleAuth() {
+    install(Authentication) {
+        // JWT認証（モバイルアプリ向け）
+        jwt("user-jwt") {
+            // ... JWT設定
+        }
+
+        // API Key認証（サーバー間通信向け）
+        apiKey("service-api-key") {
+            validate { credential ->
+                if (isValidApiKey(credential)) {
+                    ApiKeyPrincipal(credential)
+                } else {
+                    null
+                }
+            }
+        }
+    }
+}
+
+routing {
+    // ユーザー向けエンドポイント（JWT認証）
+    authenticate("user-jwt") {
+        get("/api/user/profile") {
+            val principal = call.principal<JWTPrincipal>()!!
+            call.respond(getUserProfile(principal))
+        }
+    }
+
+    // 内部サービス向けエンドポイント（API Key認証）
+    authenticate("service-api-key") {
+        get("/api/internal/users") {
+            call.respond(getAllUsers())
+        }
+    }
+
+    // どちらかの認証方式でアクセス可能
+    authenticate("user-jwt", "service-api-key", optional = false) {
+        get("/api/data") {
+            val userPrincipal = call.principal<JWTPrincipal>()
+            val apiKeyPrincipal = call.principal<ApiKeyPrincipal>()
+
+            when {
+                userPrincipal != null -> call.respond(getUserData(userPrincipal))
+                apiKeyPrincipal != null -> call.respond(getServiceData())
+                else -> call.respond(HttpStatusCode.Unauthorized)
+            }
+        }
+    }
+}
+```
+
+---
+
+#### API Keyのセキュリティベストプラクティス
+
+**1. API Keyの保存場所**
+
+```kotlin
+// ✅ 良い例：環境変数
+val apiKey = System.getenv("THIRD_PARTY_API_KEY")
+
+// ✅ 良い例：AWS Secrets Manager
+suspend fun getApiKey(): String {
+    val secretsManagerClient = SecretsManagerClient { region = "ap-northeast-1" }
+    val response = secretsManagerClient.getSecretValue {
+        secretId = "prod/third-party-api-key"
+    }
+    return response.secretString!!
+}
+
+// ❌ 悪い例：ハードコード
+val apiKey = "sk_live_1234567890abcdef"  // 絶対にやらない！
+```
+
+**2. 送信方法**
+
+```kotlin
+// ✅ 推奨：Authorizationヘッダー
+client.get("https://api.example.com/data") {
+    header("Authorization", "Bearer $apiKey")
+}
+
+// ✅ 代替：カスタムヘッダー
+client.get("https://api.example.com/data") {
+    header("X-API-Key", apiKey)
+}
+
+// ❌ 非推奨：クエリパラメータ（ログに残りやすい）
+client.get("https://api.example.com/data?api_key=$apiKey")
+```
+
+**3. API Keyのハッシュ化保存**
+
+```kotlin
+// データベーススキーマ
+@Serializable
+data class ApiKeyRecord(
+    val id: String,
+    val name: String,
+    val hashedKey: String,  // ハッシュ化されたキー
+    val prefix: String,      // 先頭8文字（識別用）
+    val createdAt: Instant,
+    val lastUsedAt: Instant?,
+    val expiresAt: Instant?
+)
+
+// API Key生成
+suspend fun generateApiKey(name: String): Pair<String, ApiKeyRecord> {
+    val apiKey = "sk_live_${generateSecureRandomString(32)}"
+    val hashedKey = hashApiKey(apiKey)
+    val prefix = apiKey.take(8)
+
+    val record = ApiKeyRecord(
+        id = UUID.randomUUID().toString(),
+        name = name,
+        hashedKey = hashedKey,
+        prefix = prefix,
+        createdAt = Instant.now(),
+        lastUsedAt = null,
+        expiresAt = Instant.now().plus(365, ChronoUnit.DAYS)
+    )
+
+    apiKeyRepository.save(record)
+
+    // 生成されたキーは一度だけ返す
+    return apiKey to record
+}
+
+fun generateSecureRandomString(length: Int): String {
+    val bytes = ByteArray(length)
+    SecureRandom().nextBytes(bytes)
+    return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
+}
+```
+
+**4. API Keyのローテーション**
+
+```kotlin
+data class ApiKeyWithExpiry(
+    val key: String,
+    val expiresAt: Instant
+)
+
+suspend fun rotateApiKey(oldKeyId: String): ApiKeyWithExpiry {
+    // 新しいキーを生成
+    val (newKey, newRecord) = generateApiKey("rotated-key")
+
+    // 古いキーに猶予期間を設定（30日後に無効化）
+    apiKeyRepository.update(oldKeyId) {
+        it.copy(expiresAt = Instant.now().plus(30, ChronoUnit.DAYS))
+    }
+
+    return ApiKeyWithExpiry(newKey, newRecord.expiresAt!!)
+}
+```
+
+**5. レート制限**
+
+```kotlin
+import io.ktor.server.plugins.ratelimit.*
+import kotlin.time.Duration.Companion.minutes
+
+fun Application.configureApiKeyRateLimit() {
+    install(RateLimit) {
+        register(RateLimitName("api-key-limit")) {
+            rateLimiter(limit = 100, refillPeriod = 1.minutes)
+            requestKey { call ->
+                call.principal<ApiKeyPrincipal>()?.apiKey ?: "unknown"
+            }
+        }
+    }
+}
+
+routing {
+    rateLimit(RateLimitName("api-key-limit")) {
+        authenticate("api-key-auth") {
+            get("/api/internal/data") {
+                call.respond(getData())
+            }
+        }
+    }
+}
+```
+
+**6. 監査ログ**
+
+```kotlin
+install(createApplicationPlugin(name = "ApiKeyAudit") {
+    onCall { call ->
+        val apiKeyPrincipal = call.principal<ApiKeyPrincipal>()
+        if (apiKeyPrincipal != null) {
+            // 使用記録
+            auditLogger.info {
+                mapOf(
+                    "apiKeyPrefix" to apiKeyPrincipal.apiKey.take(8),
+                    "endpoint" to call.request.uri,
+                    "method" to call.request.httpMethod.value,
+                    "timestamp" to Instant.now()
+                )
+            }
+
+            // 最終使用時刻を更新
+            apiKeyRepository.updateLastUsed(apiKeyPrincipal.apiKey)
+        }
+    }
+})
+```
+
+---
+
+#### API Keyの管理API例
+
+```kotlin
+// 管理者用API
+authenticate("admin-jwt") {
+    // API Keyの一覧表示
+    get("/admin/api-keys") {
+        val keys = apiKeyRepository.listAll()
+        call.respond(keys.map {
+            mapOf(
+                "id" to it.id,
+                "name" to it.name,
+                "prefix" to it.prefix,
+                "createdAt" to it.createdAt,
+                "lastUsedAt" to it.lastUsedAt,
+                "expiresAt" to it.expiresAt
+            )
+        })
+    }
+
+    // API Keyの生成
+    post("/admin/api-keys") {
+        val request = call.receive<CreateApiKeyRequest>()
+        val (apiKey, record) = generateApiKey(request.name)
+
+        call.respond(HttpStatusCode.Created, mapOf(
+            "apiKey" to apiKey,  // 一度だけ表示
+            "id" to record.id,
+            "prefix" to record.prefix,
+            "expiresAt" to record.expiresAt
+        ))
+    }
+
+    // API Keyの無効化
+    delete("/admin/api-keys/{id}") {
+        val id = call.parameters["id"]!!
+        apiKeyRepository.delete(id)
+        call.respond(HttpStatusCode.NoContent)
+    }
+
+    // API Keyのローテーション
+    post("/admin/api-keys/{id}/rotate") {
+        val id = call.parameters["id"]!!
+        val newKey = rotateApiKey(id)
+        call.respond(mapOf(
+            "newApiKey" to newKey.key,
+            "expiresAt" to newKey.expiresAt,
+            "gracePeriodDays" to 30
+        ))
+    }
+}
+
+@Serializable
+data class CreateApiKeyRequest(
+    val name: String
+)
+```
+
+---
+
+#### まとめ：API Key認証
+
+**API Key認証が適している場面**:
+- サーバー間通信
+- サードパーティAPIアクセス
+- 内部ツール・管理用API
+- Webhookエンドポイント
+
+**セキュリティのポイント**:
+1. ✅ API Keyを環境変数やSecrets Managerで管理
+2. ✅ データベースにはハッシュ化して保存
+3. ✅ Authorizationヘッダーで送信
+4. ✅ 定期的にローテーション
+5. ✅ レート制限を設定
+6. ✅ 使用状況を監査ログに記録
+
+**OAuth/JWTとの使い分け**:
+- **OAuth/JWT**: エンドユーザーの認証・認可
+- **API Key**: アプリケーション・サービスの認証
+
+---
+
 ### まとめ
 
 この章で学んだこと:
@@ -441,6 +897,7 @@ fun Application.configureCognitoAuth() {
 6. ✅ **セッション管理**
 7. ✅ **トークンリフレッシュ**
 8. ✅ **AWS Cognito統合**
+9. ✅ **API Key認証とセキュリティベストプラクティス**
 
 ---
 
@@ -460,5 +917,8 @@ fun Application.configureCognitoAuth() {
 - [ ] セッションCookieを使用できる
 - [ ] トークンリフレッシュを実装できる
 - [ ] AWS Cognitoと統合できる
+- [ ] API Key認証の使用ケースを理解している
+- [ ] API Keyのセキュリティベストプラクティスを実践できる
+- [ ] 複数の認証方式を併用できる
 
 全てチェックできたら、次のPartに進みましょう！
