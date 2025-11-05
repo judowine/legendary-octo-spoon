@@ -1,0 +1,21 @@
+<configuration>
+    <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <root level="INFO">
+        <appender-ref ref="STDOUT"/>
+    </root>
+
+    <!-- Ktorのログレベル -->
+    <logger name="io.ktor" level="INFO"/>
+    <logger name="io.ktor.routing" level="DEBUG"/>
+
+    <!-- Exposedのログレベル -->
+    <logger name="Exposed" level="DEBUG"/>
+
+    <!-- アプリケーションのログレベル -->
+    <logger name="com.example" level="DEBUG"/>
+</configuration>

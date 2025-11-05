@@ -1,0 +1,103 @@
+version: '3.8'
+
+services:
+  # PostgreSQLデータベース
+  postgres:
+    image: postgres:15-alpine
+    container_name: account-system-db
+    environment:
+      POSTGRES_DB: account_system
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - account-system-network
+
+  # Redis（セッション管理・レート制限）
+  redis:
+    image: redis:7-alpine
+    container_name: account-system-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - account-system-network
+
+  # MailHog（開発用メールサーバー）
+  mailhog:
+    image: mailhog/mailhog:latest
+    container_name: account-system-mailhog
+    ports:
+      - "1025:1025"  # SMTP
+      - "8025:8025"  # Web UI
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8025"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - account-system-network
+
+  # Ktorアプリケーション
+  app:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: account-system-app
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: jdbc:postgresql://postgres:5432/account_system
+      DATABASE_USER: admin
+      DATABASE_PASSWORD: admin_password
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      JWT_SECRET: your-secret-key-change-in-production-min-256-bits
+      JWT_ISSUER: account-system
+      JWT_AUDIENCE: account-system-users
+      JWT_ACCESS_TOKEN_EXPIRY: 900000
+      JWT_REFRESH_TOKEN_EXPIRY: 2592000000
+      SMTP_HOST: mailhog
+      SMTP_PORT: 1025
+      SMTP_FROM: noreply@example.com
+      APP_ENV: development
+      APP_PORT: 8080
+      APP_HOST: 0.0.0.0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mailhog:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - account-system-network
+
+networks:
+  account-system-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
