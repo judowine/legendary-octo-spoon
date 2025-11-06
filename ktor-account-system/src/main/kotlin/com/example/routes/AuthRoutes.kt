@@ -178,9 +178,69 @@ fun Route.authRoutes() {
             }
         }
 
+        // パスワードリセット要求
+        post("/password-reset/request") {
+            try {
+                val request = call.receive<PasswordResetRequest>()
+
+                // バリデーション
+                passwordResetRequestValidator(request).getOrThrow()
+
+                // パスワードリセット要求処理
+                val response = authService.requestPasswordReset(request.email)
+
+                call.respond(HttpStatusCode.OK, response)
+            } catch (e: ValidationException) {
+                call.respond(
+                    HttpStatusCode.BadRequest,
+                    ErrorResponse(
+                        error = "ValidationError",
+                        message = "入力内容に誤りがあります",
+                        fields = e.errors.mapValues { it.value.joinToString(", ") },
+                        timestamp = Clock.System.now().toString(),
+                        path = call.request.path()
+                    )
+                )
+            }
+        }
+
+        // パスワードリセット実行
+        post("/password-reset/confirm") {
+            try {
+                val request = call.receive<PasswordResetConfirmRequest>()
+
+                // バリデーション
+                passwordResetConfirmRequestValidator(request).getOrThrow()
+
+                // パスワードリセット実行処理
+                val response = authService.confirmPasswordReset(request)
+
+                call.respond(HttpStatusCode.OK, response)
+            } catch (e: ValidationException) {
+                call.respond(
+                    HttpStatusCode.BadRequest,
+                    ErrorResponse(
+                        error = "ValidationError",
+                        message = "入力内容に誤りがあります",
+                        fields = e.errors.mapValues { it.value.joinToString(", ") },
+                        timestamp = Clock.System.now().toString(),
+                        path = call.request.path()
+                    )
+                )
+            } catch (e: NotFoundException) {
+                call.respond(
+                    HttpStatusCode.BadRequest,
+                    ErrorResponse(
+                        error = "InvalidToken",
+                        message = e.message ?: "リセットトークンが無効または期限切れです",
+                        timestamp = Clock.System.now().toString(),
+                        path = call.request.path()
+                    )
+                )
+            }
+        }
+
         // TODO: その他の認証エンドポイント
-        // - POST /password-reset/request - パスワードリセット要求
-        // - POST /password-reset/confirm - パスワードリセット実行
         // - GET /oauth/{provider} - OAuth認証開始
         // - GET /oauth/{provider}/callback - OAuthコールバック
     }

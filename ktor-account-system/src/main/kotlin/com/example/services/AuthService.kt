@@ -7,6 +7,7 @@ import com.example.plugins.ForbiddenException
 import com.example.plugins.NotFoundException
 import com.example.plugins.UnauthorizedException
 import com.example.repositories.EmailVerificationRepository
+import com.example.repositories.PasswordResetRepository
 import com.example.repositories.RefreshTokenRepository
 import com.example.repositories.UserRepository
 import com.example.security.JwtConfig
@@ -22,6 +23,7 @@ import java.time.temporal.ChronoUnit
 class AuthService(
     private val userRepository: UserRepository = UserRepository(),
     private val emailVerificationRepository: EmailVerificationRepository = EmailVerificationRepository(),
+    private val passwordResetRepository: PasswordResetRepository = PasswordResetRepository(),
     private val refreshTokenRepository: RefreshTokenRepository = RefreshTokenRepository(),
     private val emailService: EmailService = EmailService(),
     private val tokenService: TokenService = TokenService()
@@ -289,6 +291,96 @@ class AuthService(
 
         return LogoutResponse(
             message = "ログアウトしました"
+        )
+    }
+
+    /**
+     * パスワードリセット要求
+     *
+     * @param email メールアドレス
+     * @return パスワードリセットレスポンス
+     */
+    fun requestPasswordReset(email: String): PasswordResetResponse {
+        logger.info("パスワードリセット要求: $email")
+
+        // セキュリティのため、ユーザーが存在しない場合も同じレスポンスを返す
+        val user = userRepository.findByEmail(email)
+
+        if (user != null) {
+            // パスワードが設定されていない（OAuth専用ユーザー）
+            if (user.passwordHash == null) {
+                logger.warn("パスワードリセット要求: OAuth専用ユーザー - $email")
+                // セキュリティのため、同じレスポンスを返す
+            } else {
+                // 既存の未使用トークンを削除
+                passwordResetRepository.deleteUnusedTokensByUserId(user.id)
+
+                // 新しいトークンを生成
+                val resetToken = TokenGenerator.generatePasswordResetToken()
+                val expiresAt = Instant.now().plus(1, ChronoUnit.HOURS) // 1時間有効
+
+                passwordResetRepository.create(
+                    userId = user.id,
+                    token = resetToken,
+                    expiresAt = expiresAt
+                )
+
+                logger.info("パスワードリセットトークンを生成しました: userId=${user.id}")
+
+                // リセットメールを送信
+                emailService.sendPasswordResetEmail(
+                    to = user.email,
+                    token = resetToken,
+                    userName = user.displayName
+                )
+
+                logger.info("パスワードリセットメールを送信しました: $email")
+            }
+        } else {
+            logger.warn("パスワードリセット要求: ユーザーが見つかりません - $email")
+            // セキュリティのため、ユーザーが存在しない場合も同じレスポンスを返す
+        }
+
+        return PasswordResetResponse(
+            message = "パスワードリセット用のメールを送信しました"
+        )
+    }
+
+    /**
+     * パスワードリセット実行
+     *
+     * @param request パスワードリセット確認リクエスト
+     * @return パスワードリセット確認レスポンス
+     * @throws NotFoundException トークンが無効または期限切れの場合
+     */
+    fun confirmPasswordReset(request: PasswordResetConfirmRequest): PasswordResetConfirmResponse {
+        logger.info("パスワードリセット実行を開始")
+
+        // トークンを検索
+        val (tokenId, userId) = passwordResetRepository.findValidToken(request.token)
+            ?: run {
+                logger.warn("無効なリセットトークンが使用されました")
+                throw NotFoundException("リセットトークンが無効または期限切れです")
+            }
+
+        logger.info("有効なリセットトークンを確認しました: userId=$userId")
+
+        // 新しいパスワードをハッシュ化
+        val newPasswordHash = PasswordHasher.hashPassword(request.newPassword)
+
+        // パスワードを更新
+        userRepository.updatePassword(userId, newPasswordHash)
+
+        // トークンを使用済みにする
+        passwordResetRepository.markAsUsed(tokenId)
+
+        // セキュリティのため、全てのリフレッシュトークンを無効化
+        refreshTokenRepository.revokeAllByUserId(userId)
+
+        logger.info("パスワードリセットが完了しました: userId=$userId")
+
+        return PasswordResetConfirmResponse(
+            message = "パスワードがリセットされました"
         )
     }
 
