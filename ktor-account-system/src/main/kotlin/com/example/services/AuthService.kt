@@ -1,13 +1,15 @@
 package com.example.services
 
-import com.example.models.dto.RegisterRequest
-import com.example.models.dto.RegisterResponse
-import com.example.models.dto.VerifyEmailResponse
+import com.example.models.dto.*
 import com.example.models.entities.User
 import com.example.plugins.ConflictException
+import com.example.plugins.ForbiddenException
 import com.example.plugins.NotFoundException
+import com.example.plugins.UnauthorizedException
 import com.example.repositories.EmailVerificationRepository
+import com.example.repositories.RefreshTokenRepository
 import com.example.repositories.UserRepository
+import com.example.security.JwtConfig
 import com.example.security.PasswordHasher
 import com.example.security.TokenGenerator
 import org.slf4j.LoggerFactory
@@ -20,7 +22,9 @@ import java.time.temporal.ChronoUnit
 class AuthService(
     private val userRepository: UserRepository = UserRepository(),
     private val emailVerificationRepository: EmailVerificationRepository = EmailVerificationRepository(),
-    private val emailService: EmailService = EmailService()
+    private val refreshTokenRepository: RefreshTokenRepository = RefreshTokenRepository(),
+    private val emailService: EmailService = EmailService(),
+    private val tokenService: TokenService = TokenService()
 ) {
     private val logger = LoggerFactory.getLogger(AuthService::class.java)
 
@@ -164,5 +168,156 @@ class AuthService(
         )
 
         logger.info("メール認証トークンを再送しました: ${user.email}")
+    }
+
+    /**
+     * ログイン
+     *
+     * @param request ログインリクエスト
+     * @return ログインレスポンス
+     * @throws UnauthorizedException 認証情報が無効な場合
+     * @throws ForbiddenException メール未認証の場合
+     */
+    fun login(request: LoginRequest): LoginResponse {
+        logger.info("ログインを開始: ${request.email}")
+
+        // ユーザーを検索
+        val user = userRepository.findByEmail(request.email)
+            ?: run {
+                logger.warn("ログイン失敗: ユーザーが見つかりません - ${request.email}")
+                throw UnauthorizedException("メールアドレスまたはパスワードが正しくありません")
+            }
+
+        // パスワードが設定されていない（OAuth専用ユーザー）
+        if (user.passwordHash == null) {
+            logger.warn("ログイン失敗: パスワード未設定 - ${request.email}")
+            throw UnauthorizedException("このアカウントはソーシャルログイン専用です")
+        }
+
+        // パスワード検証
+        if (!PasswordHasher.verifyPassword(request.password, user.passwordHash)) {
+            logger.warn("ログイン失敗: パスワードが正しくありません - ${request.email}")
+            throw UnauthorizedException("メールアドレスまたはパスワードが正しくありません")
+        }
+
+        // メール認証チェック
+        if (!user.isEmailVerified) {
+            logger.warn("ログイン失敗: メール未認証 - ${request.email}")
+            throw ForbiddenException("メールアドレスの認証が完了していません")
+        }
+
+        logger.info("ログイン成功: userId=${user.id}, email=${user.email}")
+
+        // トークンを生成
+        return generateTokens(user)
+    }
+
+    /**
+     * トークン更新
+     *
+     * @param refreshToken リフレッシュトークン
+     * @return トークン更新レスポンス
+     * @throws UnauthorizedException リフレッシュトークンが無効な場合
+     */
+    fun refreshToken(refreshToken: String): RefreshTokenResponse {
+        logger.info("トークン更新を開始")
+
+        // リフレッシュトークンをハッシュ化
+        val tokenHash = TokenGenerator.hashToken(refreshToken)
+
+        // トークンを検索
+        val (tokenId, userId) = refreshTokenRepository.findValidToken(tokenHash)
+            ?: run {
+                logger.warn("無効なリフレッシュトークンが使用されました")
+                throw UnauthorizedException("リフレッシュトークンが無効または期限切れです")
+            }
+
+        logger.info("有効なリフレッシュトークンを確認しました: userId=$userId")
+
+        // ユーザーを検索
+        val user = userRepository.findById(userId)
+            ?: run {
+                logger.error("ユーザーが見つかりません: userId=$userId")
+                throw UnauthorizedException("ユーザーが見つかりません")
+            }
+
+        // 古いトークンを無効化
+        refreshTokenRepository.revoke(tokenId)
+
+        logger.info("トークン更新成功: userId=$userId")
+
+        // 新しいトークンを生成
+        val accessToken = tokenService.generateAccessToken(user)
+        val newRefreshToken = TokenGenerator.generateRefreshToken()
+        val newRefreshTokenHash = TokenGenerator.hashToken(newRefreshToken)
+        val expiresAt = Instant.now().plus(JwtConfig.refreshTokenExpiry, ChronoUnit.MILLIS)
+
+        // 新しいリフレッシュトークンを保存
+        refreshTokenRepository.create(
+            userId = user.id,
+            tokenHash = newRefreshTokenHash,
+            expiresAt = expiresAt
+        )
+
+        return RefreshTokenResponse(
+            accessToken = accessToken,
+            refreshToken = newRefreshToken,
+            expiresIn = JwtConfig.getAccessTokenExpiryInSeconds()
+        )
+    }
+
+    /**
+     * ログアウト
+     *
+     * @param refreshToken リフレッシュトークン
+     * @return ログアウトレスポンス
+     */
+    fun logout(refreshToken: String): LogoutResponse {
+        logger.info("ログアウトを開始")
+
+        // リフレッシュトークンをハッシュ化
+        val tokenHash = TokenGenerator.hashToken(refreshToken)
+
+        // トークンを無効化
+        val revoked = refreshTokenRepository.revokeByHash(tokenHash)
+
+        if (revoked) {
+            logger.info("ログアウト成功: トークンを無効化しました")
+        } else {
+            logger.warn("ログアウト: トークンが見つかりませんでした")
+        }
+
+        return LogoutResponse(
+            message = "ログアウトしました"
+        )
+    }
+
+    /**
+     * トークンを生成してレスポンスを返す
+     */
+    private fun generateTokens(user: User): LoginResponse {
+        // Access Tokenを生成
+        val accessToken = tokenService.generateAccessToken(user)
+
+        // Refresh Tokenを生成
+        val refreshToken = TokenGenerator.generateRefreshToken()
+        val refreshTokenHash = TokenGenerator.hashToken(refreshToken)
+        val expiresAt = Instant.now().plus(JwtConfig.refreshTokenExpiry, ChronoUnit.MILLIS)
+
+        // リフレッシュトークンをデータベースに保存
+        refreshTokenRepository.create(
+            userId = user.id,
+            tokenHash = refreshTokenHash,
+            expiresAt = expiresAt
+        )
+
+        logger.info("トークンを生成しました: userId=${user.id}")
+
+        return LoginResponse(
+            accessToken = accessToken,
+            refreshToken = refreshToken,
+            expiresIn = JwtConfig.getAccessTokenExpiryInSeconds(),
+            user = user.toDto()
+        )
     }
 }

@@ -1,10 +1,7 @@
 package com.example.routes
 
-import com.example.models.dto.ErrorResponse
-import com.example.models.dto.RegisterRequest
-import com.example.models.dto.VerifyEmailRequest
-import com.example.plugins.ConflictException
-import com.example.plugins.NotFoundException
+import com.example.models.dto.*
+import com.example.plugins.*
 import com.example.services.AuthService
 import com.example.validation.*
 import io.ktor.http.*
@@ -91,10 +88,97 @@ fun Route.authRoutes() {
             }
         }
 
+        // ログイン
+        post("/login") {
+            try {
+                val request = call.receive<LoginRequest>()
+
+                // バリデーション
+                loginRequestValidator(request).getOrThrow()
+
+                // ログイン処理
+                val response = authService.login(request)
+
+                call.respond(HttpStatusCode.OK, response)
+            } catch (e: ValidationException) {
+                call.respond(
+                    HttpStatusCode.BadRequest,
+                    ErrorResponse(
+                        error = "ValidationError",
+                        message = "入力内容に誤りがあります",
+                        fields = e.errors.mapValues { it.value.joinToString(", ") },
+                        timestamp = Clock.System.now().toString(),
+                        path = call.request.path()
+                    )
+                )
+            } catch (e: UnauthorizedException) {
+                call.respond(
+                    HttpStatusCode.Unauthorized,
+                    ErrorResponse(
+                        error = "InvalidCredentials",
+                        message = e.message ?: "メールアドレスまたはパスワードが正しくありません",
+                        timestamp = Clock.System.now().toString(),
+                        path = call.request.path()
+                    )
+                )
+            } catch (e: ForbiddenException) {
+                call.respond(
+                    HttpStatusCode.Forbidden,
+                    ErrorResponse(
+                        error = "EmailNotVerified",
+                        message = e.message ?: "メールアドレスの認証が完了していません",
+                        timestamp = Clock.System.now().toString(),
+                        path = call.request.path()
+                    )
+                )
+            }
+        }
+
+        // トークン更新
+        post("/refresh") {
+            try {
+                val request = call.receive<RefreshTokenRequest>()
+
+                // トークン更新処理
+                val response = authService.refreshToken(request.refreshToken)
+
+                call.respond(HttpStatusCode.OK, response)
+            } catch (e: UnauthorizedException) {
+                call.respond(
+                    HttpStatusCode.Unauthorized,
+                    ErrorResponse(
+                        error = "InvalidRefreshToken",
+                        message = e.message ?: "リフレッシュトークンが無効または期限切れです",
+                        timestamp = Clock.System.now().toString(),
+                        path = call.request.path()
+                    )
+                )
+            }
+        }
+
+        // ログアウト
+        post("/logout") {
+            try {
+                val request = call.receive<LogoutRequest>()
+
+                // ログアウト処理
+                val response = authService.logout(request.refreshToken)
+
+                call.respond(HttpStatusCode.OK, response)
+            } catch (e: Exception) {
+                call.respond(
+                    HttpStatusCode.InternalServerError,
+                    ErrorResponse(
+                        error = "InternalServerError",
+                        message = "ログアウト処理中にエラーが発生しました",
+                        timestamp = Clock.System.now().toString(),
+                        path = call.request.path()
+                    )
+                )
+            }
+        }
+
         // TODO: その他の認証エンドポイント
-        // - POST /login - ログイン
-        // - POST /refresh - トークン更新
-        // - POST /logout - ログアウト
         // - POST /password-reset/request - パスワードリセット要求
         // - POST /password-reset/confirm - パスワードリセット実行
         // - GET /oauth/{provider} - OAuth認証開始
